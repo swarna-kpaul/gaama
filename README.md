@@ -1,4 +1,4 @@
-# GAAMA: Graph-Augmented Agentic Memory Architecture
+# GAAMA: Graph Augmented Associative Memory for Agents
 
 GAAMA is a long-term memory system for AI agents that combines a structured knowledge graph with neural-adaptive Personalized PageRank (PPR) retrieval. It extracts entities, facts, episodes, reflections, and skills from agent conversations, stores them in a knowledge graph with typed edges, and retrieves relevant memories using a hybrid BM25 + semantic vector search fused with graph-based PPR scoring.
 
