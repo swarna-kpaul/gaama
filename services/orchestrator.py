@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
+logger = logging.getLogger(__name__)
+
+# Default similarity threshold for connecting related nodes
+DEFAULT_SIMILARITY_THRESHOLD = 0.75
+
 from gaama.adapters import BlobStoreAdapter, GraphStoreAdapter, NodeStoreAdapter, VectorStoreAdapter
 from gaama.adapters.interfaces import EmbeddingAdapter, LLMAdapter, VectorStoreAdapter
-from gaama.adapters.sqlite_memory import get_first_episode_in_batch
 from gaama.core import (
     Edge,
     EvalReport,
@@ -26,8 +29,6 @@ from gaama.core import (
 )
 from gaama.core.policies import ExtractionPolicy
 from gaama.infra.prompt_loader import load_prompt
-from gaama.infra.serialization import node_to_embed_text
-from gaama.services.graph_edges import build_edges_from_nodes
 from gaama.services.interfaces import (
     CreateOptions,
     Evaluator,
@@ -38,7 +39,7 @@ from gaama.services.interfaces import (
     RetrievalEngine,
     TraceNormalizer,
 )
-from gaama.services.semantic_canonicalization import EdgeCanonicalizer, NodeCanonicalizer
+from gaama.services.ltm_creator import LTMCreator
 
 
 class AgenticMemoryOrchestrator:
@@ -56,14 +57,13 @@ class AgenticMemoryOrchestrator:
         blob_store: BlobStoreAdapter,
         extraction_policy: ExtractionPolicy | None = None,
         embedder: EmbeddingAdapter | None = None,
-        canonicalizer: NodeCanonicalizer | None = None,
-        edge_canonicalizer: EdgeCanonicalizer | None = None,
         budget_llm_adapter: LLMAdapter | None = None,
         budget_llm_model_name: str | None = None,
         budget_llm_max_tokens: int = 512,
         trace_buffer_max_events: int = 200,
         context_max_items: int = 50,
         context_max_tokens: int = 1200,
+        similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     ) -> None:
         self._normalizer = normalizer
         self._extractor = extractor
@@ -79,15 +79,25 @@ class AgenticMemoryOrchestrator:
         self._context_max_items = context_max_items
         self._context_max_tokens = context_max_tokens
         self._embedder = embedder
-        self._canonicalizer = canonicalizer
-        self._edge_canonicalizer = edge_canonicalizer
         self._budget_llm_adapter = budget_llm_adapter
         self._budget_llm_model_name = budget_llm_model_name
         self._budget_llm_max_tokens = budget_llm_max_tokens
         self._trace_buffer_max_events = trace_buffer_max_events
+        self._similarity_threshold = similarity_threshold
         self._trace_buffer: Dict[str, List[TraceEvent]] = {}
         self._last_flushed_index: Dict[str, int] = {}
         self._last_created_index: Dict[str, int] = {}
+
+        # LLM adapter is extracted from the extractor (may be None)
+        _llm = getattr(self._extractor, "_llm", None)
+        self._ltm_creator = LTMCreator(
+            node_store=node_store,
+            graph_store=graph_store,
+            vector_store=vector_store,
+            embedder=embedder,
+            llm=_llm,
+            similarity_threshold=similarity_threshold,
+        )
 
     def _buffer_for(self, agent_id: str) -> List[TraceEvent]:
         if agent_id not in self._trace_buffer:
@@ -131,7 +141,9 @@ class AgenticMemoryOrchestrator:
         events: List[TraceEvent],
         max_tokens_per_chunk: int,
     ) -> List[List[TraceEvent]]:
-        """Divide events into chunks such that each chunk's total token count does not exceed max_tokens_per_chunk."""
+        """Divide events into chunks such that each chunk's total token count does not exceed max_tokens_per_chunk.
+        Events are never split; each event is assigned entirely to one bucket. Fills a bucket until adding the
+        next event would exceed the limit, then starts a new bucket."""
         if max_tokens_per_chunk <= 0 or not events:
             return [events] if events else []
         chunks: List[List[TraceEvent]] = []
@@ -150,9 +162,17 @@ class AgenticMemoryOrchestrator:
         return chunks
 
     def create(self, options: CreateOptions) -> Sequence[str]:
-        """Create LTM nodes from the trace-event buffer (events since last create)."""
+        """Create LTM nodes from the trace-event buffer.
+
+        Handles buffer management and chunking, then delegates each chunk
+        to ``LTMCreator.create_from_events()`` for the four-step pipeline
+        (episodes -> related-episode edges -> facts -> reflections).
+
+        Chunking: if options.max_tokens_per_chunk is set, events are divided into
+        token-bounded buckets; else if options.chunk_size > 0, events are processed
+        in fixed-size chunks; otherwise all events are processed in one pass.
+        """
         _t0 = time.perf_counter()
-        _profile: List[Tuple[str, float]] = []
 
         if not options.agent_id or not options.agent_id.strip():
             raise ValueError("agent_id is required for memory creation.")
@@ -162,10 +182,8 @@ class AgenticMemoryOrchestrator:
         events = list(buf[lc + 1:])
         if not events:
             return []
-        _profile.append(("buffer_slice", time.perf_counter() - _t0))
 
-        # Chunk: by max_tokens_per_chunk (bucket fill), or by chunk_size/overlap, or single chunk.
-        _t = time.perf_counter()
+        # Chunk events
         if options.max_tokens_per_chunk is not None and options.max_tokens_per_chunk > 0:
             chunks = self._events_to_token_bounded_chunks(events, options.max_tokens_per_chunk)
             print(f"\n--- create() token-bounded chunks (max_tokens_per_chunk={options.max_tokens_per_chunk}) ---")
@@ -185,7 +203,6 @@ class AgenticMemoryOrchestrator:
                     events[i : i + chunk_size]
                     for i in range(0, len(events), step)
                 ]
-        _profile.append(("chunking", time.perf_counter() - _t))
 
         scope = Scope(
             agent_id=agent_id,
@@ -193,116 +210,37 @@ class AgenticMemoryOrchestrator:
             task_id=options.task_id or None,
         )
         all_node_ids: List[str] = []
-        _t = time.perf_counter()
+
         sequence_offset = 0
         if hasattr(self._node_store, "get_max_sequence"):
             sequence_offset = self._node_store.get_max_sequence(agent_id)
         elif hasattr(self._node_store, "get_max_episode_sequence"):
             sequence_offset = self._node_store.get_max_episode_sequence(agent_id)
-        _profile.append(("get_sequence_offset", time.perf_counter() - _t))
+
+        filters = QueryFilters(
+            agent_id=agent_id,
+            task_id=options.task_id or None,
+        )
 
         for chunk_idx, chunk_events in enumerate(chunks):
             if not chunk_events:
                 continue
-            _chunk_t0 = time.perf_counter()
+            print(f"[create] processing chunk {chunk_idx + 1}/{len(chunks)} ({len(chunk_events)} events)")
+            chunk_ids, total_new = self._ltm_creator.create_from_events(
+                chunk_events,
+                scope,
+                filters=filters,
+                sequence_offset=sequence_offset,
+            )
+            all_node_ids.extend(chunk_ids)
+            sequence_offset += total_new
 
-            _t = time.perf_counter()
-            result = self._extractor.extract(chunk_events)
-            valid_nodes = list(result.nodes)
-            _profile.append(("extract", time.perf_counter() - _t))
-            if not valid_nodes:
-                continue
-
-            for node in valid_nodes:
-                node.scopes = [scope]
-            for i, node in enumerate(valid_nodes):
-                node.sequence = sequence_offset + (i + 1)
-            sequence_offset += len(valid_nodes)
-
-            new_episodes = [n for n in valid_nodes if (n.kind or "").strip().lower() == "episode"]
-
-            _t = time.perf_counter()
-            edges = build_edges_from_nodes(valid_nodes, result.edge_specs)
-            node_id_map = self._canonicalize_nodes(valid_nodes)
-            _profile.append(("build_edges+canonicalize_nodes", time.perf_counter() - _t))
-
-            _t = time.perf_counter()
-            remapped: List[Edge] = []
-            for e in edges:
-                new_src = node_id_map.get(e.source_id, e.source_id)
-                new_tgt = node_id_map.get(e.target_id, e.target_id)
-                if new_src != new_tgt:
-                    remapped.append(Edge(
-                        edge_id=e.edge_id,
-                        edge_type=e.edge_type,
-                        source_id=new_src,
-                        target_id=new_tgt,
-                        created_at=e.created_at,
-                        label=getattr(e, "label", "") or "",
-                        weight=getattr(e, "weight", 1.0),
-                    ))
-            edges = remapped
-            _profile.append(("remap_edges", time.perf_counter() - _t))
-
-            _t = time.perf_counter()
-            now = datetime.utcnow()
-            if new_episodes and hasattr(self._node_store, "get_last_episode_node"):
-                last_existing = self._node_store.get_last_episode_node(agent_id)
-                first_new = get_first_episode_in_batch(new_episodes, edges) or new_episodes[0]
-                if last_existing and last_existing.node_id != first_new.node_id:
-                    edges.append(Edge(
-                        edge_id=f"edge-{uuid4().hex}",
-                        edge_type="NEXT",
-                        source_id=last_existing.node_id,
-                        target_id=first_new.node_id,
-                        created_at=now,
-                    ))
-            _profile.append(("get_last_episode+NEXT_edge", time.perf_counter() - _t))
-
-            _t = time.perf_counter()
-            node_ids = self._node_store.upsert_nodes(valid_nodes)
-            all_node_ids.extend(node_ids)
-            _profile.append(("upsert_nodes", time.perf_counter() - _t))
-
-            _t = time.perf_counter()
-            if edges:
-                self._graph_store.upsert_edges(edges)
-            _profile.append(("upsert_edges", time.perf_counter() - _t))
-
-            _t = time.perf_counter()
-            self._upsert_node_embeddings(valid_nodes)
-            _profile.append(("upsert_node_embeddings", time.perf_counter() - _t))
-
-            _t = time.perf_counter()
-            self._index_nodes_in_canonicalizer(valid_nodes)
-            _profile.append(("index_nodes_in_canonicalizer", time.perf_counter() - _t))
-
-            _chunk_elapsed = time.perf_counter() - _chunk_t0
-            print(f"[create] chunk {chunk_idx + 1}/{len(chunks)}: {len(valid_nodes)} nodes, {len(edges)} edges — {_chunk_elapsed:.2f}s")
-
-        _t = time.perf_counter()
+        # Update last-created index
         if buf:
             self._last_created_index[agent_id] = len(buf) - 1
-        _profile.append(("update_last_created", time.perf_counter() - _t))
 
         _total = time.perf_counter() - _t0
-        # Aggregate by step name and print summary
-        _by_step: Dict[str, float] = {}
-        for name, sec in _profile:
-            _by_step[name] = _by_step.get(name, 0.0) + sec
-        print("\n--- create() time profile summary ---")
-        for name in [
-            "buffer_slice", "chunking", "get_sequence_offset",
-            "extract", "build_edges+canonicalize_nodes", "remap_edges",
-            "get_last_episode+NEXT_edge",
-            "upsert_nodes", "upsert_edges", "upsert_node_embeddings",
-            "index_nodes_in_canonicalizer", "update_last_created",
-        ]:
-            sec = _by_step.get(name, 0.0)
-            pct = (sec / _total * 100) if _total > 0 else 0
-            print(f"  {name}: {sec:.3f}s ({pct:.1f}%)")
-        print(f"  TOTAL: {_total:.3f}s")
-        print("--------------------------------------\n")
+        print(f"\n--- create() total: {_total:.3f}s, {len(all_node_ids)} nodes ---\n")
         return all_node_ids
 
     def _derive_budget_from_llm(
@@ -314,7 +252,7 @@ class AgenticMemoryOrchestrator:
         max_memory_items: int,
         model_name: str | None = None,
     ) -> RetrievalBudget:
-        """Call LLM to derive retrieval budget from query."""
+        """Call LLM to derive retrieval budget from query; LLM distributes max_memory_items across categories."""
         prompt = load_prompt(
             "retrieval_budget",
             {"query": query, "max_memory_items": str(max_memory_items)},
@@ -336,6 +274,7 @@ class AgenticMemoryOrchestrator:
             )
         if not isinstance(data, dict):
             return base
+        # Parse category caps; clamp each to [0, max_memory_items]
         def _int(key: str, default: int) -> int:
             val = data.get(key)
             if val is None:
@@ -350,12 +289,14 @@ class AgenticMemoryOrchestrator:
         max_s = _int("max_skills", base.max_skills)
         max_e = _int("max_episodes", base.max_episodes)
         total = max_f + max_r + max_s + max_e
+        # Enforce sum <= max_memory_items (scale down proportionally if over)
         if total > max_memory_items and total > 0:
             scale = max_memory_items / total
             max_f = max(0, int(round(max_f * scale)))
             max_r = max(0, int(round(max_r * scale)))
             max_s = max(0, int(round(max_s * scale)))
             max_e = max(0, int(round(max_e * scale)))
+            # Ensure sum exactly max_memory_items (adjust largest category for rounding)
             current = max_f + max_r + max_s + max_e
             if current < max_memory_items and max_e > 0:
                 max_e += max_memory_items - current
@@ -371,9 +312,10 @@ class AgenticMemoryOrchestrator:
         )
 
     def _apply_max_memory_items(self, budget: RetrievalBudget, max_memory_items: int) -> RetrievalBudget:
-        """Scale the four category caps so they sum to max_memory_items."""
+        """Scale the four category caps so they sum to max_memory_items (LTM uses these, not max_items)."""
         total = budget.max_facts + budget.max_reflections + budget.max_skills + budget.max_episodes
         if total <= 0:
+            # Equal split
             q, r = divmod(max_memory_items, 4)
             return RetrievalBudget(
                 max_tokens=budget.max_tokens,
@@ -410,7 +352,7 @@ class AgenticMemoryOrchestrator:
         agent_id = options.filters.agent_id
         sources = options.sources
 
-        # Optional: derive budget from query via LLM
+        # Optional: derive budget from query via LLM (internal adapter + model name)
         effective_budget = options.budget
         if options.use_llm_budget and self._budget_llm_adapter is not None:
             model_name = options.budget_llm_model_name or self._budget_llm_model_name
@@ -429,6 +371,7 @@ class AgenticMemoryOrchestrator:
                     max_memory_items=max_memory_items,
                     model_name=model_name,
                 )
+        # When max_memory_items is set, ensure the four category caps sum to it (LTM uses these, not max_items)
         if options.max_memory_items is not None:
             effective_budget = self._apply_max_memory_items(
                 effective_budget, max(1, options.max_memory_items)
@@ -476,6 +419,7 @@ class AgenticMemoryOrchestrator:
         user_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Sequence[TraceEvent]:
+        """Return trace events for the agent, optionally filtered by user_id and/or task_id."""
         buf = list(self._buffer_for(agent_id))
         if user_id is not None:
             buf = [e for e in buf if getattr(e, "user_id", None) == user_id]
@@ -490,6 +434,7 @@ class AgenticMemoryOrchestrator:
         user_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Tuple[Sequence[TraceEvent], int]:
+        """Return (events_since_index, current_len) for the filtered trace buffer."""
         buf = list(self._buffer_for(agent_id))
         if user_id is not None:
             buf = [e for e in buf if getattr(e, "user_id", None) == user_id]
@@ -530,113 +475,3 @@ class AgenticMemoryOrchestrator:
             lines.append(event.content)
             total_tokens += est
         return "\n".join(reversed(lines))
-
-    # -- Semantic canonicalization ---------------------------------------------
-
-    def _canonicalize_nodes(self, nodes: list[MemoryNode]) -> Dict[str, str]:
-        out: Dict[str, str] = {}
-        if not self._canonicalizer:
-            for node in nodes:
-                out[node.node_id] = node.node_id
-            return out
-
-        if self._embedder and hasattr(self._embedder, "embed_batch"):
-            texts = [node_to_embed_text(n) or "" for n in nodes]
-            self._embedder.embed_batch(texts)
-
-        def _resolve_one(node: MemoryNode):
-            old_id = node.node_id
-            match = self._canonicalizer.resolve_node(node)
-            return old_id, node, match
-
-        results: list[tuple] = []
-        with ThreadPoolExecutor(max_workers=min(len(nodes), 8)) as pool:
-            futures = {pool.submit(_resolve_one, n): n for n in nodes}
-            for fut in as_completed(futures):
-                results.append(fut.result())
-
-        for old_id, node, match in results:
-            if match.matched_existing:
-                node.node_id = match.node_id
-                existing = self._node_store.get_nodes([match.node_id])
-                if existing:
-                    merged = list(existing[0].scopes)
-                    for s in node.scopes:
-                        if s not in merged:
-                            merged.append(s)
-                    node.scopes = merged
-            out[old_id] = node.node_id
-        return out
-
-    def _index_nodes_in_canonicalizer(self, nodes: list[MemoryNode]) -> None:
-        if not self._canonicalizer:
-            return
-        self._canonicalizer.index_nodes(nodes)
-
-    def _canonicalize_edges(
-        self, edges: list[Edge],
-        agent_id: str | None = None, user_id: str | None = None, task_id: str | None = None,
-    ) -> list[Edge]:
-        if not self._edge_canonicalizer or not edges:
-            return edges
-        resolved: list[Edge] = []
-        seen_ids: set[str] = set()
-        for edge in edges:
-            match = self._edge_canonicalizer.resolve_edge(edge, agent_id=agent_id, user_id=user_id, task_id=task_id)
-            if match.edge_id in seen_ids:
-                continue
-            seen_ids.add(match.edge_id)
-            resolved.append(Edge(
-                edge_id=match.edge_id,
-                edge_type=edge.edge_type,
-                source_id=edge.source_id,
-                target_id=edge.target_id,
-                created_at=edge.created_at,
-                label=edge.label,
-                weight=edge.weight,
-            ))
-        return resolved
-
-    def _index_edges_in_canonicalizer(
-        self, edges: list[Edge],
-        agent_id: str | None = None, user_id: str | None = None, task_id: str | None = None,
-    ) -> None:
-        if not self._edge_canonicalizer:
-            return
-        self._edge_canonicalizer.index_edges(edges, agent_id=agent_id, user_id=user_id, task_id=task_id)
-
-    # -- Node embedding --------------------------------------------------------
-
-    def _upsert_node_embeddings(self, nodes: list[MemoryNode]) -> int:
-        if not self._embedder or not nodes:
-            return 0
-        if not hasattr(self._vector_store, "upsert_embeddings"):
-            return 0
-
-        texts: list[str] = []
-        text_indices: list[int] = []
-        for i, node in enumerate(nodes):
-            text = node_to_embed_text(node)
-            if text:
-                texts.append(text)
-                text_indices.append(i)
-
-        if not texts:
-            return 0
-
-        if hasattr(self._embedder, "embed_batch"):
-            embeddings = self._embedder.embed_batch(texts)
-            for j, emb in enumerate(embeddings):
-                if emb:
-                    nodes[text_indices[j]].embedding = list(emb)
-        else:
-            for j, text in enumerate(texts):
-                emb = self._embedder.embed(text)
-                if emb:
-                    nodes[text_indices[j]].embedding = list(emb)
-
-        to_upsert = [n for n in nodes if getattr(n, "embedding", None)]
-        if not to_upsert:
-            return 0
-        ids = self._vector_store.upsert_embeddings(to_upsert)
-        return len(ids) if ids is not None else len(to_upsert)

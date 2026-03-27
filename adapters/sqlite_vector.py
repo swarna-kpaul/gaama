@@ -176,7 +176,7 @@ class SqliteVectorStore(VectorStoreAdapter):
             return []
         query_blob = _serialize_f32(query_vec)
         # Fetch extra to account for multi-scope duplicates
-        k = max(top_k * 5, 20)
+        k = max(top_k * 2, 20)
 
         allowed_ids: list[str] | None = None
         if self._node_store and (

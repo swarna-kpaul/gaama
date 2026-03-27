@@ -2,7 +2,8 @@
 
 Five node kinds (Entity, Fact, Episode, Reflection, Skill) stored as a single
 MemoryNode dataclass with a ``kind`` discriminator.  Edges are typed structural
-relationships (SUBJECT, OBJECT, ABOUT, …); belief scores live on nodes, not edges.
+relationships (NEXT, DERIVED_FROM, HAS_CONCEPT, …); belief scores live on nodes,
+not edges.
 """
 from __future__ import annotations
 
@@ -16,14 +17,11 @@ from uuid import uuid4
 # Constants
 # ---------------------------------------------------------------------------
 
-ALLOWED_NODE_KINDS = frozenset({"entity", "fact", "episode", "reflection", "skill"})
+ALLOWED_NODE_KINDS = frozenset({"entity", "fact", "episode", "reflection", "skill", "concept"})
 
 ALLOWED_EDGE_TYPES = frozenset({
-    "SUBJECT", "OBJECT", "ABOUT", "SUPPORTED_BY",
-    "CONTRADICTS", "REFINES", "INVOLVES", "MENTIONS",
-    "PRODUCED", "TRIGGERED_BY", "NEXT", "DERIVED_FROM",
-    "LEARNED_FROM", "HAS_SKILL", "RELATED_TO",
-    "USES_TOOL", "APPLIES_TO",
+    "NEXT", "DERIVED_FROM", "DERIVED_FROM_FACT",
+    "HAS_CONCEPT", "ABOUT_CONCEPT",
 })
 
 
@@ -121,9 +119,15 @@ class MemoryNode:
     # --- Reflection fields ---
     reflection_text: str = ""
 
+    # --- Concept fields ---
+    concept_label: str = ""
+
     # --- Skill fields ---
     skill_description: str = ""
     utility: float = 0.0
+
+    # --- Common scoring ---
+    relevance_score: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +157,6 @@ class QueryFilters:
     workspace_id: Optional[str] = None
     time_range: Optional[Tuple[datetime, datetime]] = None
     tags: Dict[str, str] = field(default_factory=dict)
-    skip_stm: bool = False
 
 
 @dataclass
@@ -220,6 +223,108 @@ class MemoryPack:
             lines.append("")
         return "\n".join(lines).strip()
 
+    def trim_by_words(self, max_words: int, budget: Optional["RetrievalBudget"] = None) -> "MemoryPack":
+        """Return a new MemoryPack trimmed so that to_text() stays under *max_words*.
+
+        Removal is distributed **proportionally** across categories according to
+        their budget caps so that no single category is drained before others.
+
+        For facts, reflections, and skills the last item is the lowest-ranked
+        (LTM fills buckets in descending score order).  For episodes -- which are
+        reordered chronologically -- the item with the **lowest relevance score**
+        is removed instead, preserving temporal order of the survivors.
+
+        Scores are read from ``self.scores`` (populated by LTM retrieval).
+        If scores are unavailable the function falls back to removing the last item.
+        If *budget* is None the four categories are treated as equal weight.
+        """
+        categories = ["facts", "reflections", "skills", "episodes"]
+
+        # Mutable copy of item lists
+        items: Dict[str, List[str]] = {
+            cat: list(getattr(self, cat)) for cat in categories
+        }
+
+        def _word_count() -> int:
+            return sum(len(s.split()) for cat in categories for s in items[cat])
+
+        if _word_count() <= max_words:
+            return self
+
+        # Budget weights (proportional share per category)
+        budget_map = {
+            "facts": budget.max_facts if budget else 1,
+            "reflections": budget.max_reflections if budget else 1,
+            "skills": budget.max_skills if budget else 1,
+            "episodes": budget.max_episodes if budget else 1,
+        }
+        total_budget = sum(budget_map.values()) or 1
+
+        # Parallel score lists (used for score-aware removal of episodes)
+        score_lists: Dict[str, List[float]] = {}
+        for cat in categories:
+            if self.scores and cat in self.scores:
+                score_lists[cat] = list(self.scores[cat])
+            else:
+                score_lists[cat] = []
+
+        # Compute per-item word counts (cache for efficiency)
+        word_counts: Dict[str, List[int]] = {
+            cat: [len(s.split()) for s in items[cat]] for cat in categories
+        }
+
+        # Iteratively remove items until under budget.
+        # Each round, pick the category that is most over-represented relative
+        # to its budget share and remove its lowest-ranked item.
+        while _word_count() > max_words:
+            # Find which categories still have items
+            non_empty = [cat for cat in categories if items[cat]]
+            if not non_empty:
+                break
+
+            # For each non-empty category compute how over-represented it is:
+            #   actual_share / target_share  (higher = more over-represented)
+            total_words = _word_count() or 1
+            worst_cat = None
+            worst_ratio = -1.0
+            for cat in non_empty:
+                cat_words = sum(word_counts[cat])
+                target_share = budget_map[cat] / total_budget
+                actual_share = cat_words / total_words
+                ratio = actual_share / target_share if target_share > 0 else float("inf")
+                if ratio > worst_ratio:
+                    worst_ratio = ratio
+                    worst_cat = cat
+
+            if worst_cat is None:
+                break
+
+            # For episodes: remove the item with the lowest relevance score
+            # (preserves chronological order of survivors).
+            # For other categories: remove the last item (already lowest-ranked).
+            if worst_cat == "episodes" and score_lists.get("episodes"):
+                min_idx = min(
+                    range(len(score_lists["episodes"])),
+                    key=lambda i: score_lists["episodes"][i],
+                )
+                items["episodes"].pop(min_idx)
+                word_counts["episodes"].pop(min_idx)
+                score_lists["episodes"].pop(min_idx)
+            else:
+                items[worst_cat].pop()
+                word_counts[worst_cat].pop()
+                if score_lists.get(worst_cat):
+                    score_lists[worst_cat].pop()
+
+        return MemoryPack(
+            facts=items["facts"],
+            reflections=items["reflections"],
+            skills=items["skills"],
+            episodes=items["episodes"],
+            citations=list(self.citations),
+            scores={cat: score_lists[cat] for cat in categories} if any(score_lists.values()) else None,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Other data types (unchanged)
@@ -260,41 +365,6 @@ class PolicyDelta:
     retrieval_weights: Dict[str, float] = field(default_factory=dict)
     integration_budgets: Dict[str, int] = field(default_factory=dict)
     notes: Sequence[str] = field(default_factory=list)
-
-
-@dataclass
-class STMContextItem:
-    item_id: str
-    content: str
-    created_at: datetime
-    token_estimate: int
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class STMWorkingNote:
-    key: str
-    value: Any
-    confidence: float
-    provenance: Sequence[ProvenanceRef] = field(default_factory=list)
-    pinned_until: Optional[datetime] = None
-    updated_at: datetime = field(default_factory=datetime.utcnow)
-    agent_id: Optional[str] = None
-
-
-@dataclass
-class STMEpisode:
-    episode_id: str
-    task_id: Optional[str]
-    start_ts: datetime
-    end_ts: datetime
-    summary: str
-    key_events: Sequence[str] = field(default_factory=list)
-    outcomes: Sequence[str] = field(default_factory=list)
-    unresolved_items: Sequence[str] = field(default_factory=list)
-    embedding: Optional[Sequence[float]] = None
-    belief: float = 0.0
-    agent_id: Optional[str] = None
 
 
 @dataclass

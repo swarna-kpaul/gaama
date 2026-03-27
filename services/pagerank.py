@@ -17,22 +17,12 @@ EdgeTuple = Tuple[str, str, float]
 # that edge type.
 # ---------------------------------------------------------------------------
 DEFAULT_EDGE_TYPE_WEIGHTS: Dict[str, float] = {
-    "SUBJECT":       1.0,
-    "OBJECT":        1.0,
-    "INVOLVES":      0.9,
-    "MENTIONS":      0.7,
-    "TRIGGERED_BY":  0.7,
-    "ABOUT":         0.7,
-    "SUPPORTED_BY":  0.6,
-    "PRODUCED":      0.6,
-    "DERIVED_FROM":  0.6,
-    "LEARNED_FROM":  0.6,
-    "USES_TOOL":     0.6,
-    "APPLIES_TO":    0.6,
-    "RELATED_TO":    0.5,
-    "CONTRADICTS":   0.5,
-    "REFINES":       0.5,
-    "NEXT":          0.5,
+    # Concept-graph edge types (primary)
+    "HAS_CONCEPT":        0.8,
+    "ABOUT_CONCEPT":      0.8,
+    "NEXT":               0.8,
+    "DERIVED_FROM":       0.8,
+    "DERIVED_FROM_FACT":  0.5,
 }
 
 _DEFAULT_EDGE_TYPE_FALLBACK = 0.5
@@ -137,10 +127,10 @@ def edges_from_core_edges(
     for e in core_edges:
         src = getattr(e, "source_id", None)
         tgt = getattr(e, "target_id", None)
-        edge_type = getattr(e, "edge_type", "RELATED_TO") or "RELATED_TO"
-        base_w = _type_w.get(edge_type, _DEFAULT_EDGE_TYPE_FALLBACK)
+        edge_type = getattr(e, "edge_type", "DERIVED_FROM") or "DERIVED_FROM"
         stored_w = max(0.0, float(getattr(e, "weight", 1.0)))
-        w = base_w * stored_w
+        base_w = _type_w.get(edge_type, _DEFAULT_EDGE_TYPE_FALLBACK)
+        w = base_w * (stored_w ** 2)
         if src is None or tgt is None:
             continue
         directed.append((src, tgt, w))

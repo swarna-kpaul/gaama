@@ -18,9 +18,9 @@ from gaama.core import (
 class EdgeSpec:
     """Index-based edge from extractor; indices refer to the combined node list.
 
-    ``edge_type`` is one of the structural relationship types (SUBJECT,
-    OBJECT, ABOUT, INVOLVES, …).  ``label`` is an optional freeform
-    description.
+    ``edge_type`` is one of the concept-graph relationship types (NEXT,
+    DERIVED_FROM, HAS_CONCEPT, ABOUT_CONCEPT, …).  ``label`` is an optional
+    freeform description.
     """
     source_index: int
     target_index: int
@@ -33,30 +33,6 @@ class ExtractResult:
     """Result of memory extraction: nodes and optional index-based edge specs for the same batch."""
     nodes: Sequence[MemoryNode]
     edge_specs: Sequence[EdgeSpec] = ()
-
-
-@dataclass
-class EpisodeSummaryResult:
-    summary: str
-    outcomes: Sequence[str]
-    unresolved_items: Sequence[str]
-
-
-@dataclass
-class STMNoteItem:
-    key: str
-    value: object
-    confidence: float
-
-
-class EpisodeSummarizer(Protocol):
-    def summarize(self, events: Sequence[TraceEvent]) -> EpisodeSummaryResult:
-        ...
-
-
-class STMNoteExtractor(Protocol):
-    def extract_notes(self, events: Sequence[TraceEvent]) -> Sequence[STMNoteItem]:
-        ...
 
 
 @dataclass
@@ -89,8 +65,20 @@ class RetrieveOptions:
     expansion_depth: int | None = None
     edge_type_weights: dict[str, float] | None = None
     """Override edge-type weights for PPR transitions. None = use defaults."""
-    adaptive_ppr_model: object | None = None
-    """AdaptivePPRModel instance for query-adaptive PPR weighting. None = use fixed ppr_score_weight."""
+    semantic_only: bool = False
+    """If True, skip graph expansion and PPR. Use pure semantic KNN retrieval ranked by similarity."""
+    hybrid: bool = False
+    """If True, run semantic + PPR in parallel, merge, and LLM-rerank to select relevant items."""
+    llm: object | None = None
+    """LLM adapter for hybrid reranking. Required when hybrid=True."""
+    llm_model: str | None = None
+    """LLM model name for hybrid reranking."""
+    max_memory_words: int = 1000
+    """Max words per retriever output before merging in hybrid mode."""
+    hybrid_fusion: str = "rrf"
+    """Fusion mode for hybrid retrieval: 'rrf' (reciprocal rank fusion) or 'max_score'."""
+    budgetless: bool = False
+    """If True, ignore per-type budget caps. Fill by global score ranking until max_memory_words is hit."""
     use_llm_budget: bool = False
     """If True and orchestrator has budget_llm_adapter + budget_llm_model_name, derive LTM budget from query via LLM."""
     budget_llm_model_name: str | None = None

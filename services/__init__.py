@@ -1,17 +1,17 @@
 from .answer_from_memory import answer_from_memory
-from .graph_edges import build_edges_from_nodes
+from .graph_edges import build_edges_from_nodes, make_edge
 from .hybrid_search import HybridSearchConfig, HybridSearcher
 from .llm_extractors import (
-    LLMEpisodeSummarizer,
-    LLMMemoryExtractor,
-    LLMSTMNoteExtractor,
+    LLMFactExtractor,
+    LLMReflectionExtractor,
     NoOpMemoryExtractor,
 )
-from .ltm import (
+from .ltm_retriever import (
     NodeKNNPageRankRetrievalEngine,
     LTMForgettingEngine,
     LTMIntegrationComposer,
 )
+from .ltm_creator import LTMCreator
 from .orchestrator import AgenticMemoryOrchestrator
 
 __all__ = [
@@ -19,12 +19,13 @@ __all__ = [
     "AgenticMemoryOrchestrator",
     "HybridSearchConfig",
     "HybridSearcher",
-    "LLMEpisodeSummarizer",
-    "LLMMemoryExtractor",
-    "LLMSTMNoteExtractor",
+    "LLMFactExtractor",
+    "LLMReflectionExtractor",
+    "LTMCreator",
     "NodeKNNPageRankRetrievalEngine",
     "LTMForgettingEngine",
     "LTMIntegrationComposer",
     "NoOpMemoryExtractor",
     "build_edges_from_nodes",
+    "make_edge",
 ]

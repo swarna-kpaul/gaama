@@ -29,23 +29,15 @@ from gaama.core.policies import ExtractionPolicy
 from gaama.services.defaults import DefaultTraceNormalizer, SimpleEvaluator
 from gaama.services.interfaces import CreateOptions, RetrieveOptions, RetrievalSource
 from gaama.services.orchestrator import AgenticMemoryOrchestrator
-from gaama.services.ltm import (
+from gaama.services.ltm_retriever import (
     NodeKNNPageRankRetrievalEngine,
     LTMForgettingEngine,
     LTMIntegrationComposer,
 )
 from gaama.services.llm_extractors import (
-    LLMEpisodeSummarizer,
-    LLMMemoryExtractor,
-    LLMSTMNoteExtractor,
     NoOpMemoryExtractor,
 )
 from gaama.services.hybrid_search import HybridSearchConfig, HybridSearcher
-from gaama.services.semantic_canonicalization import (
-    CanonicalizationConfig,
-    EdgeCanonicalizer,
-    NodeCanonicalizer,
-)
 
 
 class AgenticMemorySDK:
@@ -77,8 +69,15 @@ class AgenticMemorySDK:
         degree_correction: bool | None = None,
         expansion_depth: int | None = None,
         edge_type_weights: dict[str, float] | None = None,
-        adaptive_ppr_model: object | None = None,
+        semantic_only: bool = False,
+        hybrid: bool = False,
+        llm: object | None = None,
+        llm_model: str | None = None,
+        max_memory_words: int = 600,
+        hybrid_fusion: str = "rrf",
+        budgetless: bool = False,
     ) -> MemoryPack:
+        # Allow passing a single RetrieveOptions as second argument: sdk.retrieve(query, options)
         if isinstance(filters, RetrieveOptions):
             return self._orchestrator.retrieve(query, filters)
         if filters is None:
@@ -96,7 +95,13 @@ class AgenticMemorySDK:
             degree_correction=degree_correction,
             expansion_depth=expansion_depth,
             edge_type_weights=edge_type_weights,
-            adaptive_ppr_model=adaptive_ppr_model,
+            semantic_only=semantic_only,
+            hybrid=hybrid,
+            llm=llm,
+            llm_model=llm_model,
+            max_memory_words=max_memory_words,
+            hybrid_fusion=hybrid_fusion,
+            budgetless=budgetless,
         )
         return self._orchestrator.retrieve(query, options)
 
@@ -120,8 +125,8 @@ class AgenticMemorySDK:
         return self._orchestrator.evaluate(dataset_id)
 
     def flush_stm_episode(self) -> None:
-        """No-op: GAAMA does not include STM."""
-        self._orchestrator.flush_stm_episode(self._agent_id)
+        """No-op stub: GAAMA does not include STM."""
+        pass
 
 
 def create_default_sdk(settings: SDKSettings, agent_id: str) -> AgenticMemorySDK:
@@ -146,10 +151,12 @@ def create_default_sdk(settings: SDKSettings, agent_id: str) -> AgenticMemorySDK
         llm_adapter = create_llm_adapter(settings.llm)
 
     normalizer = DefaultTraceNormalizer()
-    if settings.llm and llm_adapter is not None:
-        extractor = LLMMemoryExtractor(llm_adapter, max_tokens=settings.llm.max_tokens)
-    else:
-        extractor = NoOpMemoryExtractor()
+    # Extractor is NoOp; LTMCreator (inside orchestrator) handles fact/reflection extraction via LLM
+    extractor = NoOpMemoryExtractor()
+    if llm_adapter is not None:
+        # Store llm on the extractor so the orchestrator can pass it to LTMCreator
+        extractor._llm = llm_adapter
+
     hybrid_searcher = HybridSearcher(
         memory_store,
         vector_store,
@@ -162,21 +169,6 @@ def create_default_sdk(settings: SDKSettings, agent_id: str) -> AgenticMemorySDK
     forgetter = LTMForgettingEngine(memory_store)
     integrator = LTMIntegrationComposer()
     evaluator = SimpleEvaluator()
-    canonicalizer = NodeCanonicalizer(
-        config=CanonicalizationConfig(),
-        memory_store=memory_store,
-        hybrid_searcher=hybrid_searcher,
-    )
-    edge_canonicalizer = EdgeCanonicalizer(
-        config=CanonicalizationConfig(),
-        memory_store=memory_store,
-        hybrid_searcher=hybrid_searcher,
-        graph_store=memory_store,
-    )
-    existing_edges = memory_store.list_all_edges(limit=10_000) if hasattr(memory_store, "list_all_edges") else []
-    if existing_edges:
-        edge_canonicalizer.index_edges(existing_edges, agent_id=agent_id)
-
     orchestrator = AgenticMemoryOrchestrator(
         normalizer=normalizer,
         extractor=extractor,
@@ -190,8 +182,6 @@ def create_default_sdk(settings: SDKSettings, agent_id: str) -> AgenticMemorySDK
         blob_store=blob_store,
         extraction_policy=ExtractionPolicy(),
         embedder=embedder,
-        canonicalizer=canonicalizer,
-        edge_canonicalizer=edge_canonicalizer,
         budget_llm_adapter=llm_adapter,
         budget_llm_model_name=settings.llm.model if settings.llm else None,
         budget_llm_max_tokens=512,

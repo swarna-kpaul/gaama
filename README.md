@@ -1,16 +1,49 @@
 # GAAMA: Graph Augmented Associative Memory for Agents
 
-GAAMA is a long-term memory system for AI agents that combines a structured knowledge graph with neural-adaptive Personalized PageRank (PPR) retrieval. It extracts entities, facts, episodes, reflections, and skills from agent conversations, stores them in a knowledge graph with typed edges, and retrieves relevant memories using a hybrid BM25 + semantic vector search fused with graph-based PPR scoring.
+GAAMA is a long-term memory system for AI agents that combines a structured knowledge graph with Personalized PageRank (PPR) retrieval. It extracts facts, concepts, episodes, and reflections from agent conversations using a concept-node pipeline, stores them in a knowledge graph with typed edges, and retrieves relevant memories using semantic KNN or graph-enhanced PPR scoring.
 
 ## Architecture Overview
 
-GAAMA's retrieval pipeline works in three stages:
+GAAMA's pipeline works in three stages:
 
-1. **Knowledge Graph Construction**: Conversations are processed by an LLM extractor that produces typed memory nodes (entities, facts, episodes, reflections, skills) and structural edges (SUBJECT, OBJECT, INVOLVES, MENTIONS, SUPPORTED_BY, NEXT, etc.). Nodes are deduplicated via hybrid BM25+semantic canonicalization.
+### 1. Concept-Node LTM Creation
 
-2. **Hybrid Retrieval with PPR**: At query time, semantic KNN finds seed nodes, which are expanded via graph edges. Personalized PageRank propagates relevance through the graph using edge-type-aware transition weights with hub dampening. The final score combines PPR and similarity: `score = w_ppr * PPR(node) + w_sim * sim(node, query)`.
+Conversations are processed in three steps (500 tokens per chunk, `gpt-4o-mini`):
 
-3. **Neural Adaptive Weighting**: A lightweight MLP (gap regression) predicts per-query whether graph-based PPR helps or hurts retrieval quality. It learns from `(query_embedding, reward_gap)` pairs where `reward_gap = reward(ppr=1) - reward(ppr=0)`. At inference, queries where PPR helps get `ppr_weight=1.0`; others fall back to pure similarity with `ppr_weight=0.01`.
+- **Step 1 — Episodes**: Raw conversation turns become episode nodes (no LLM needed). Each turn is stored as-is with timestamps and metadata. Episodes are chained via `NEXT` edges.
+- **Step 2 — Facts + Concepts**: An LLM extracts atomic facts and topic concepts from episodes. Facts connect to their source episodes via `DERIVED_FROM` edges. Concepts connect to episodes via `HAS_CONCEPT` and to facts via `ABOUT_CONCEPT` edges. Concepts serve as cross-cutting paths through the graph.
+- **Step 3 — Reflections**: An LLM generates higher-order insights by synthesizing multiple facts. Reflections connect to source facts via `DERIVED_FROM_FACT` edges.
+
+### 2. Retrieval (Two Modes)
+
+**Semantic Retrieval** (`semantic_only=True`):
+- Pure cosine similarity KNN over node embeddings
+- Ranks all node kinds (facts, episodes, reflections) by relevance
+- Trimmed to 1000 words with proportional budget allocation
+- Best for direct factual and detailed questions
+
+**PPR-Enhanced Retrieval** (`ppr_score_weight=0.1`):
+- KNN finds seed nodes → top 40 seeds selected by similarity
+- Graph expansion (depth=2) via concept/fact/episode edges
+- Personalized PageRank propagates relevance through the graph (alpha=0.6)
+- Final score: `score = 0.1 * PPR(node) + 1.0 * sim(node, query)`
+- Best for temporal and cross-entity questions
+
+### 3. Memory Pack with Word Trimming
+
+Retrieved memories are packed into a `MemoryPack` (facts, reflections, skills, episodes) and trimmed to fit a word budget (default 1000 words). Trimming is proportional to budget caps — categories that are over-represented lose items first. Episodes are trimmed by lowest relevance score to preserve temporal order.
+
+### Edge Types
+
+The concept-node graph uses 8 edge types:
+
+| Edge Type | Connects | Weight |
+|---|---|---|
+| `NEXT` | Episode → Episode (temporal chain) | 0.8 |
+| `DERIVED_FROM` | Fact → Episode (provenance) | 0.8 |
+| `HAS_CONCEPT` | Episode → Concept | 0.8 |
+| `ABOUT_CONCEPT` | Fact → Concept | 0.8 |
+| `DERIVED_FROM_FACT` | Reflection → Fact | 0.5 |
 
 ### Storage
 
@@ -22,12 +55,6 @@ GAAMA's retrieval pipeline works in three stages:
 
 ```bash
 pip install openai sqlite-vec
-
-# For neural PPR training
-pip install torch
-
-# For ROUGE-based evaluation
-pip install rouge
 ```
 
 Set your OpenAI API key:
@@ -57,7 +84,7 @@ settings = SDKSettings(
 # Create SDK instance
 sdk = create_default_sdk(settings, agent_id="my-agent")
 
-# Ingest conversation events and extract long-term memories
+# Ingest conversation events
 events = [
     TraceEvent(event_type="message", actor="user",
                content="I visited the Eiffel Tower in Paris last week."),
@@ -65,18 +92,33 @@ events = [
                content="That sounds wonderful! How was the view from the top?"),
 ]
 sdk._orchestrator.ingest(events, agent_id="my-agent")
+
+# Create long-term memories (concept-node pipeline)
 node_ids = sdk.create(CreateOptions(
     agent_id="my-agent", user_id="user-1", task_id="conv-1",
+    max_tokens_per_chunk=500,
 ))
 print(f"Created {len(node_ids)} memory nodes")
 
-# Retrieve relevant memories
+# Retrieve with semantic retrieval
 pack = sdk.retrieve(
     query="What did the user do in Paris?",
     filters=QueryFilters(agent_id="my-agent", user_id="user-1", task_id="conv-1"),
-    budget=RetrievalBudget(max_facts=5, max_episodes=10),
-    ppr_score_weight=1.0,
+    budget=RetrievalBudget(max_facts=60, max_reflections=20, max_skills=5, max_episodes=80),
+    semantic_only=True,
+    max_memory_words=1000,
+)
+print(pack.to_text())
+
+# Retrieve with PPR-enhanced retrieval
+pack = sdk.retrieve(
+    query="What did the user do in Paris?",
+    filters=QueryFilters(agent_id="my-agent", user_id="user-1", task_id="conv-1"),
+    budget=RetrievalBudget(max_facts=60, max_reflections=20, max_skills=5, max_episodes=80),
+    ppr_score_weight=0.1,
     sim_score_weight=1.0,
+    expansion_depth=2,
+    max_memory_words=1000,
 )
 print(pack.to_text())
 ```
@@ -85,29 +127,76 @@ print(pack.to_text())
 
 The LoCoMo benchmark evaluates long-term memory over multi-session conversations (10 conversations, ~1540 questions across 4 categories: factual, temporal, inference, detailed).
 
+Evaluation scripts are in `gaama/evals/locomo/`:
+
 ```bash
 cd gaama/evals/locomo
 
-# Full pipeline: create LTM + evaluate
-python run_evaluation.py
+# Step 1: Create LTM for all samples (or specific ones)
+python run_create_ltm.py                          # all 10 samples
+python run_create_ltm.py --sample-ids conv-26     # specific sample
+python run_create_ltm.py --limit 3                # first 3 samples
 
-# Neural PPR training pipeline (requires existing LTM)
-python run_neural_ppr.py           # all steps
-python run_neural_ppr.py --step 1  # generate training data only
-python run_neural_ppr.py --step 2  # summarize training data
-python run_neural_ppr.py --step 3  # train model only
-python run_neural_ppr.py --step 4  # evaluate only
+# Step 2a: Evaluate with semantic retrieval
+python run_semantic_eval.py                              # all samples
+python run_semantic_eval.py --sample-ids conv-26 conv-30 # specific
+python run_semantic_eval.py --max-words 1200             # custom word limit
+
+# Step 2b: Evaluate with PPR retrieval
+python run_ppr_eval.py                                   # all samples
+python run_ppr_eval.py --sample-ids conv-26              # specific
+python run_ppr_eval.py --ppr-weight 0.5                  # custom PPR weight
+
+# Step 2c: RAG baseline (no LTM needed, requires index build first)
+python run_rag_baseline.py --step all                    # index + evaluate
+python run_rag_baseline.py --step all --sample-ids conv-26
+python run_rag_baseline.py --step 2 --max-words 1000     # evaluate only (index must exist)
 ```
 
-## Key Results (LoCoMo-10, hypothesis eval with GPT-4o-mini)
+Results are saved as per-sample JSONL files in `gaama/evals/locomo/data/results/`.
 
-| Configuration | Cat1 Factual | Cat2 Temporal | Cat3 Inference | Cat4 Detailed | Overall |
-|---|---|---|---|---|---|
-| Similarity only (ppr=0) | 69.2% | 48.4% | 35.9% | 81.4% | 69.5% |
-| Fixed PPR (ppr=1.0) | 68.1% | 47.3% | **40.0%** | **82.1%** | 69.7% |
-| **Neural Adaptive PPR + Hub Dampening** | **70.0%** | **49.7%** | **39.7%** | 81.9% | **70.4%** |
+### Default Configurations
 
-Neural adaptive PPR with hub dampening achieves the best overall accuracy by selectively applying graph-based retrieval where it helps (cat3 inference, cat4 detailed) while avoiding degradation on queries where similarity alone is sufficient (cat1 factual).
+| Parameter | Semantic | PPR | RAG |
+|---|---|---|---|
+| ppr_weight | 0.0 | 0.1 | — |
+| sim_weight | 1.0 | 1.0 | — |
+| facts budget | 60 | 60 | — |
+| reflections budget | 20 | 20 | — |
+| episodes budget | 80 | 80 | — |
+| max_memory_words | 1000 | 1000 | 1000 |
+| expansion_depth | — | 2 | — |
+| alpha (PPR damping) | — | 0.6 | — |
+| seeds (top-k KNN) | — | 40 | — |
+| max_tokens_per_chunk | 500 | 500 | — |
+| LLM model | gpt-4o-mini | gpt-4o-mini | gpt-4o-mini |
+| Embedding model | text-embedding-3-small | text-embedding-3-small | text-embedding-3-small |
+
+## Key Results (LoCoMo-10, 1000w, fractional hypothesis eval with GPT-4o-mini)
+
+### Overall (1540 questions, 10 conversations)
+
+| Method | Reward |
+|---|---|
+| RAG Baseline | 0.750 |
+| LTM Semantic | 0.780 |
+| **LTM PPR=0.1** | **0.789** |
+
+### By Category (Reward)
+
+| Category | N | RAG | Semantic | PPR=0.1 |
+|---|---|---|---|---|
+| Multihop Reasoning | 282 | 0.675 | **0.722** | 0.722 |
+| Temporal | 321 | 0.590 | 0.715 | **0.719** |
+| Commonsense | 96 | 0.446 | 0.492 | **0.493** |
+| Single Hop | 841 | 0.871 | 0.857 | **0.872** |
+
+### Key Findings
+
+- **PPR=0.1 is best overall**: +3.9pp reward over RAG, +1.0pp over Semantic
+- **LTM crushes RAG on temporal**: +12.9pp — structured memory with timestamps and episode chaining wins
+- **Minimal PPR weight (0.1)** works best — strong graph signal (PPR=1.0) displaces high-similarity nodes from the word-limited context, hurting accuracy
+- **Single Hop**: RAG and PPR tied — raw conversation context preserves fine-grained detail
 
 ## File Structure
 
@@ -118,19 +207,18 @@ gaama/
 ├── api/
 │   └── client.py                   # AgenticMemorySDK, create_default_sdk
 ├── core/
-│   ├── types.py                    # MemoryNode, Edge, MemoryPack, TraceEvent, etc.
+│   ├── types.py                    # MemoryNode, Edge, MemoryPack, TraceEvent
 │   └── policies.py                 # ExtractionPolicy
 ├── config/
 │   └── settings.py                 # SDKSettings, StorageSettings, LLMSettings
 ├── services/
 │   ├── orchestrator.py             # Main orchestrator (ingest, create, retrieve)
-│   ├── ltm.py                      # LTM retrieval engine (KNN + PPR + hub dampening)
+│   ├── ltm_creator.py              # Concept-node LTM creation pipeline
+│   ├── ltm_retriever.py            # LTM retrieval (semantic, PPR, hybrid)
 │   ├── pagerank.py                 # Personalized PageRank with edge-type weights
-│   ├── neural_ppr.py               # Neural adaptive PPR model (gap regression MLP)
-│   ├── llm_extractors.py           # LLM-based memory extraction
-│   ├── graph_edges.py              # Edge construction from extracted nodes
+│   ├── llm_extractors.py           # LLM fact/reflection extractors
+│   ├── graph_edges.py              # Edge construction
 │   ├── hybrid_search.py            # BM25 + semantic fusion search
-│   ├── semantic_canonicalization.py # Node/edge deduplication
 │   ├── answer_from_memory.py       # Generate answers from retrieved memory
 │   ├── defaults.py                 # Default normalizer, evaluator
 │   └── interfaces.py               # Protocol definitions
@@ -139,24 +227,23 @@ gaama/
 │   ├── sqlite_vector.py            # sqlite-vec vector store
 │   ├── openai_embedding.py         # OpenAI embedding adapter
 │   ├── openai_llm.py               # OpenAI LLM adapter
-│   ├── llm_factory.py              # LLM adapter factory
-│   ├── local_blob.py               # File-based blob store
 │   └── interfaces.py               # Adapter protocols
 ├── infra/
 │   ├── prompt_loader.py            # Load prompt templates from markdown
 │   ├── serialization.py            # Node JSON serialization
+│   ├── id_helpers.py               # Canonical ID generation helpers
 │   └── vector_math.py              # Cosine similarity
-├── prompts/                        # Prompt templates (markdown)
-│   ├── ltm_extraction.md
-│   ├── answer_from_memory.md
-│   ├── episode_summary.md
-│   ├── episode_summary_update.md
-│   ├── retrieval_budget.md
-│   └── stm_working_notes.md
+├── prompts/
+│   ├── fact_generation.md           # Fact + concept extraction prompt
+│   ├── reflection_generation.md     # Reflection generation prompt
+│   └── answer_from_memory.md        # Answer generation prompt
 └── evals/
     └── locomo/
-        ├── locomo_pipeline.py      # Full LoCoMo evaluation pipeline
-        ├── run_neural_ppr.py       # Neural PPR training + evaluation
-        ├── run_evaluation.py       # Full evaluation runner
-        └── locomo10.json           # LoCoMo-10 dataset (10 samples, 1540 questions)
+        ├── locomo10.json            # LoCoMo-10 dataset (10 conversations, 1540 questions)
+        ├── config.py                # Default evaluation configs
+        ├── locomo_eval.py           # Core evaluation functions
+        ├── run_create_ltm.py        # LTM creation CLI
+        ├── run_semantic_eval.py     # Semantic retrieval evaluation CLI
+        ├── run_ppr_eval.py          # PPR retrieval evaluation CLI
+        └── run_rag_baseline.py      # RAG baseline evaluation CLI
 ```

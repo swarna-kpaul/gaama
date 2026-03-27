@@ -12,13 +12,6 @@ class StorageSettings:
 
 
 @dataclass
-class STMSettings:
-    """When enable_persistence is True, persistence_path is the path to a single SQLite file that holds STM for all agents. Each agent's full STM is loaded into memory on first access (or via load_stm_for_agent)."""
-    enable_persistence: bool = False
-    persistence_path: Path | None = None
-
-
-@dataclass
 class LLMSettings:
     """Configuration for LLM adapter. Provider-agnostic; adapter interprets fields."""
     provider: str = "openai"
@@ -39,7 +32,6 @@ class EmbeddingSettings:
 @dataclass
 class SDKSettings:
     storage: StorageSettings
-    stm: STMSettings | None = None
     llm: LLMSettings | None = None
     embedding: EmbeddingSettings | None = None
 

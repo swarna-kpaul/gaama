@@ -10,11 +10,11 @@ from gaama.services.interfaces import EdgeSpec
 
 
 def _normalize_edge_type(raw: str) -> str:
-    """Return a valid edge type; default RELATED_TO."""
+    """Return a valid edge type; default DERIVED_FROM."""
     v = (raw or "").strip().upper().replace("-", "_").replace(" ", "_")
     if v in ALLOWED_EDGE_TYPES:
         return v
-    return "RELATED_TO"
+    return "DERIVED_FROM"
 
 
 def build_edges_from_nodes(
@@ -48,3 +48,16 @@ def build_edges_from_nodes(
         ))
 
     return edges
+
+
+def make_edge(source_id: str, target_id: str, edge_type: str, weight: float = 1.0) -> Edge:
+    """Create a single Edge between two node IDs."""
+    return Edge(
+        edge_id=f"edge-{uuid4().hex}",
+        edge_type=edge_type,
+        source_id=source_id,
+        target_id=target_id,
+        created_at=datetime.utcnow(),
+        label="",
+        weight=weight,
+    )

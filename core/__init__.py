@@ -15,9 +15,6 @@ from .types import (
     RetrievalBudget,
     BeliefSignal,
     Scope,
-    STMContextItem,
-    STMEpisode,
-    STMWorkingNote,
     TraceEvent,
 )
 
@@ -38,8 +35,5 @@ __all__ = [
     "RetrievalBudget",
     "BeliefSignal",
     "Scope",
-    "STMContextItem",
-    "STMEpisode",
-    "STMWorkingNote",
     "TraceEvent",
 ]

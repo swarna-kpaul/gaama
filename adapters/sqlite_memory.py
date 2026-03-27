@@ -260,7 +260,7 @@ class SqliteMemoryStore(NodeStoreAdapter, GraphStoreAdapter):
         except sqlite3.OperationalError:
             return 0
 
-    # ---- Edge FTS (for EdgeCanonicalizer label matching) ----
+    # ---- Edge FTS ----
 
     def insert_fts_edge(
         self, edge_id: str, content: str, *,

@@ -1,6 +1,6 @@
 """Hybrid search: BM25 (FTS5) + semantic (vector) in parallel, with score fusion.
 
-Used by NodeCanonicalizer, EdgeCanonicalizer, and LTM retrieval engines. BM25 and semantic
+Used by LTM retrieval engines. BM25 and semantic
 search run in separate threads; results are fused with configurable weights.
 """
 from __future__ import annotations

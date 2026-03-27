@@ -25,6 +25,10 @@ def node_to_embed_text(node: MemoryNode) -> str:
         t = (getattr(node, "reflection_text", "") or "").strip()
         if t:
             return t
+    elif kind == "concept":
+        t = (getattr(node, "concept_label", "") or "").strip()
+        if t:
+            return t
     elif kind == "skill":
         t = (getattr(node, "skill_description", "") or "").strip()
         if t:
