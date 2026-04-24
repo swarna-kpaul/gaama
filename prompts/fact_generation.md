@@ -17,8 +17,8 @@ You are a knowledge extraction system. Given a set of new conversation episodes 
 
 ### Rules
 1. Concepts are short topic labels (2-5 words, snake_case) representing activities, events, topics, or themes.
-2. **Good concepts**: `pottery_hobby`, `camping_trip`, `adoption_process`, `lgbtq_activism`, `beach_outing`, `charity_run`, `art_expression`, `career_transition`, `family_vacation`, `marathon_training`
-3. **Do NOT use**: Person names (e.g., NOT `caroline`, `melanie`), generic words (e.g., NOT `family`, `life`, `experience`, `conversation`, `sharing`), adjectives (e.g., NOT `beautiful`, `amazing`), dates (e.g., NOT `2023`).
+2. **Good concepts**: `camping_trip`, `adoption_process`, `beach_outing`, `charity_run`, `art_expression`, `career_transition`, `family_vacation`, `marathon_training`
+3. **Do NOT use**: Person names , generic words (e.g., NOT `family`, `life`, `experience`, `conversation`, `sharing`), adjectives (e.g., NOT `beautiful`, `amazing`), dates (e.g., NOT `2023`).
 4. **Reuse existing concepts** when applicable. Only create new concepts when no existing one fits.
 5. Each new episode should have 1-3 concepts.
 6. Each concept must be linked to the episode IDs it appears in.

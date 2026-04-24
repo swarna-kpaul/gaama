@@ -5,6 +5,9 @@ from .types import (
     EvalReport,
     EvalScore,
     ForgetReport,
+    GELConfig,
+    GELEditOp,
+    GELReport,
     IntegrationBundle,
     LTMDirectoryEntry,
     MemoryNode,
@@ -15,6 +18,7 @@ from .types import (
     RetrievalBudget,
     BeliefSignal,
     Scope,
+    SubQuestionResult,
     TraceEvent,
 )
 
@@ -25,6 +29,9 @@ __all__ = [
     "EvalReport",
     "EvalScore",
     "ForgetReport",
+    "GELConfig",
+    "GELEditOp",
+    "GELReport",
     "IntegrationBundle",
     "LTMDirectoryEntry",
     "MemoryNode",
@@ -35,5 +42,6 @@ __all__ = [
     "RetrievalBudget",
     "BeliefSignal",
     "Scope",
+    "SubQuestionResult",
     "TraceEvent",
 ]

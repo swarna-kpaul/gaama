@@ -33,6 +33,30 @@ NODE_KIND_BUDGET_CONFIG = [
 
 NODE_KNN_K = 40
 LAMBDA = 0.01
+GEL_BELIEF = 1.0
+
+
+def _scope_matches(node: MemoryNode, filters: QueryFilters) -> bool:
+    """Check if node's scopes match all non-None fields in filters."""
+    scopes = getattr(node, "scopes", None) or []
+    if filters.agent_id is not None:
+        if not any(s.agent_id == filters.agent_id for s in scopes):
+            return False
+    if filters.user_id is not None:
+        if not any(s.user_id == filters.user_id for s in scopes):
+            return False
+    if filters.task_id is not None:
+        if not any(s.task_id == filters.task_id for s in scopes):
+            return False
+    return True
+
+
+def _belief_weight(node: MemoryNode) -> float:
+    """Return belief-based weight: GEL-sourced nodes get GEL_BELIEF, others 1.0."""
+    if node.tags.get("source") == "gel":
+        return GEL_BELIEF
+    return 1.0
+
 
 def _node_content(node: MemoryNode) -> str:
     """Return the primary content string for a node based on its kind."""
@@ -156,11 +180,10 @@ class NodeKNNPageRankRetrievalEngine(RetrievalEngine):
             for n in self._node_store.get_nodes(missing_ids):
                 knn_nodes[n.node_id] = n
 
-        if filters.agent_id is not None:
-            knn_nodes = {
-                nid: n for nid, n in knn_nodes.items()
-                if any(s.agent_id == filters.agent_id for s in (n.scopes or []))
-            }
+        knn_nodes = {
+            nid: n for nid, n in knn_nodes.items()
+            if _scope_matches(n, filters)
+        }
 
         # 4b) Compute sim scores for graph-discovered nodes that have no sim score.
         #     These nodes were found via graph expansion but not in the KNN results,
@@ -206,6 +229,7 @@ class NodeKNNPageRankRetrievalEngine(RetrievalEngine):
             ppr = ppr_norm.get(nid, 0.0)
             sim = sim_norm.get(nid, 0.0)
             score = ppr_score_weight * ppr + sim_score_weight * sim
+            score *= _belief_weight(node)
             if score > 0:
                 scored.append((score, node))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -305,16 +329,16 @@ class NodeKNNPageRankRetrievalEngine(RetrievalEngine):
         if not knn_results:
             return MemoryPack(), []
 
-        # Filter by agent_id
-        if filters.agent_id is not None:
-            knn_results = [
-                (n, s) for n, s in knn_results
-                if any(sc.agent_id == filters.agent_id for sc in (n.scopes or []))
-            ]
+        # Filter by scope (agent_id, user_id, task_id)
+        knn_results = [
+            (n, s) for n, s in knn_results
+            if _scope_matches(n, filters)
+        ]
 
-        # Score = similarity (descending)
+        # Score = similarity * belief weight (descending)
         scored: List[Tuple[float, MemoryNode]] = [
-            (max(0.0, float(sim)), node) for node, sim in knn_results if sim > 0
+            (max(0.0, float(sim)) * _belief_weight(node), node)
+            for node, sim in knn_results if sim > 0
         ]
         scored.sort(key=lambda x: x[0], reverse=True)
 

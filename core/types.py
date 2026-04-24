@@ -384,3 +384,56 @@ class LTMDirectoryEntry:
     time_range: Optional[Tuple[datetime, datetime]] = None
     embedding: Optional[Sequence[float]] = None
     agent_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# GEL (Graph Edit Learning) types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GELConfig:
+    """Configuration for the Graph Edit Learning system."""
+    enabled: bool = False
+    reward_threshold: float = 0.7
+    max_analysis_questions: int = 3
+    max_edits_per_query: int = 4
+    verify_after_edit: bool = False
+    batch_only: bool = True
+    gel_fact_belief: float = 0.85
+    max_facts_per_query: int = 2
+    max_concepts_per_query: int = 2
+    dedup_similarity_threshold: float = 0.90
+    verify_edits_before_insert: bool = True
+
+
+@dataclass
+class SubQuestionResult:
+    """Result of graph exploration for a single analysis question."""
+    question: str
+    reasoning: str
+    retrieved_pack: MemoryPack
+    scored_items: List[Tuple[str, str, float]]
+    subgraph_nodes: List[MemoryNode] = field(default_factory=list)
+    subgraph_edges: List[Edge] = field(default_factory=list)
+
+
+@dataclass
+class GELEditOp:
+    """A single graph edit operation proposed by GEL."""
+    op_type: str
+    params: Dict[str, Any] = field(default_factory=dict)
+    root_cause: str = ""
+
+
+@dataclass
+class GELReport:
+    """Report from a single GEL invocation."""
+    query: str
+    reward_before: float
+    reward_after: float = 0.0
+    analysis_questions_generated: int = 0
+    chain_of_thought: str = ""
+    edits_planned: int = 0
+    edits_executed: int = 0
+    edits_skipped: int = 0
+    edit_ops: List[GELEditOp] = field(default_factory=list)
